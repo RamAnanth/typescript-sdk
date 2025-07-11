@@ -6,6 +6,7 @@ import { SSEServerTransport } from '../../server/sse.js';
 import { z } from 'zod';
 import { CallToolResult, isInitializeRequest } from '../../types.js';
 import { InMemoryEventStore } from '../shared/inMemoryEventStore.js';
+import cors from 'cors';
 
 /**
  * This example server demonstrates backwards compatibility with both:
@@ -18,56 +19,64 @@ import { InMemoryEventStore } from '../shared/inMemoryEventStore.js';
  * - /messages: The deprecated POST endpoint for older clients (POST to send messages)
  */
 
+const getServer = () => {
+  const server = new McpServer({
+    name: 'backwards-compatible-server',
+    version: '1.0.0',
+  }, { capabilities: { logging: {} } });
 
-const server = new McpServer({
-  name: 'backwards-compatible-server',
-  version: '1.0.0',
-}, { capabilities: { logging: {} } });
+  // Register a simple tool that sends notifications over time
+  server.tool(
+    'start-notification-stream',
+    'Starts sending periodic notifications for testing resumability',
+    {
+      interval: z.number().describe('Interval in milliseconds between notifications').default(100),
+      count: z.number().describe('Number of notifications to send (0 for 100)').default(50),
+    },
+    async ({ interval, count }, { sendNotification }): Promise<CallToolResult> => {
+      const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+      let counter = 0;
 
-// Register a simple tool that sends notifications over time
-server.tool(
-  'start-notification-stream',
-  'Starts sending periodic notifications for testing resumability',
-  {
-    interval: z.number().describe('Interval in milliseconds between notifications').default(100),
-    count: z.number().describe('Number of notifications to send (0 for 100)').default(50),
-  },
-  async ({ interval, count }, { sendNotification }): Promise<CallToolResult> => {
-    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-    let counter = 0;
-
-    while (count === 0 || counter < count) {
-      counter++;
-      try {
-        await sendNotification({
-          method: "notifications/message",
-          params: {
-            level: "info",
-            data: `Periodic notification #${counter} at ${new Date().toISOString()}`
-          }
-        });
-      }
-      catch (error) {
-        console.error("Error sending notification:", error);
-      }
-      // Wait for the specified interval
-      await sleep(interval);
-    }
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Started sending periodic notifications every ${interval}ms`,
+      while (count === 0 || counter < count) {
+        counter++;
+        try {
+          await sendNotification({
+            method: "notifications/message",
+            params: {
+              level: "info",
+              data: `Periodic notification #${counter} at ${new Date().toISOString()}`
+            }
+          });
         }
-      ],
-    };
-  }
-);
+        catch (error) {
+          console.error("Error sending notification:", error);
+        }
+        // Wait for the specified interval
+        await sleep(interval);
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Started sending periodic notifications every ${interval}ms`,
+          }
+        ],
+      };
+    }
+  );
+  return server;
+};
 
 // Create Express application
 const app = express();
 app.use(express.json());
+
+// Configure CORS to expose Mcp-Session-Id header for browser-based clients
+app.use(cors({
+  origin: '*', // Allow all origins - adjust as needed for production
+  exposedHeaders: ['Mcp-Session-Id']
+}));
 
 // Store transports by session ID
 const transports: Record<string, StreamableHTTPServerTransport | SSEServerTransport> = {};
@@ -125,6 +134,7 @@ app.all('/mcp', async (req: Request, res: Response) => {
       };
 
       // Connect the transport to the MCP server
+      const server = getServer();
       await server.connect(transport);
     } else {
       // Invalid request - no session ID or not initialization request
@@ -167,6 +177,7 @@ app.get('/sse', async (req: Request, res: Response) => {
   res.on("close", () => {
     delete transports[transport.sessionId];
   });
+  const server = getServer();
   await server.connect(transport);
 });
 
@@ -190,7 +201,7 @@ app.post("/messages", async (req: Request, res: Response) => {
     return;
   }
   if (transport) {
-    await transport.handlePostMessage(req, res);
+    await transport.handlePostMessage(req, res, req.body);
   } else {
     res.status(400).send('No transport found for sessionId');
   }
@@ -199,7 +210,11 @@ app.post("/messages", async (req: Request, res: Response) => {
 
 // Start the server
 const PORT = 3000;
-app.listen(PORT, () => {
+app.listen(PORT, (error) => {
+  if (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
   console.log(`Backwards compatible MCP server listening on port ${PORT}`);
   console.log(`
 ==============================================
@@ -237,7 +252,6 @@ process.on('SIGINT', async () => {
       console.error(`Error closing transport for session ${sessionId}:`, error);
     }
   }
-  await server.close();
   console.log('Server shutdown complete');
   process.exit(0);
 });
